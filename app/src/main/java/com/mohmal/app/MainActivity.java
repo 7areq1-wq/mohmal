@@ -1,23 +1,46 @@
 package com.mohmal.app;
 
 import android.app.Activity;
+import android.app.AlertDialog;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.text.InputType;
 import android.view.KeyEvent;
+import android.view.View;
 import android.webkit.CookieManager;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
+import android.webkit.WebStorage;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.widget.Button;
+import android.widget.EditText;
+import android.widget.LinearLayout;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+import org.json.JSONTokener;
 
 import java.io.ByteArrayInputStream;
+import java.util.ArrayList;
 
 public class MainActivity extends Activity {
 
     private static final String HOME = "https://www.mohmal.com/ar";
+    private static final String SITE = "https://www.mohmal.com";
+    private static final int MAX_BATCH = 20;
 
     private static final String[] OWN_HOSTS = {
             "mohmal.com", "mohmal.in", "mohmal.im",
@@ -48,14 +71,113 @@ public class MainActivity extends Activity {
                     + "(document.head||document.documentElement).appendChild(s);"
                     + "})();";
 
+    // يدور على عنوان الإيميل بالصفحة
+    private static final String FIND_ADDRESS_JS =
+            "(function(){"
+                    + "var re=/[A-Za-z0-9._%+-]+@(mailna[.]co|mozej[.]com|mailna[.]in|mailna[.]me|mohmal[.]im|mohmal[.]in)/i;"
+                    + "var t=document.body?document.body.innerText:'';"
+                    + "var m=t.match(re); if(m) return m[0];"
+                    + "var inp=document.querySelectorAll('input,textarea');"
+                    + "for(var i=0;i<inp.length;i++){var mm=(inp[i].value||'').match(re); if(mm) return mm[0];}"
+                    + "return '';"
+                    + "})()";
+
+    // يضغط زر إنشاء إيميل عشوائي
+    private static final String CLICK_CREATE_JS =
+            "(function(){"
+                    + "var els=document.querySelectorAll('button,a,input[type=button],input[type=submit],[role=button]');"
+                    + "var pri=['إنشاء بريد باسم عشوائي','عشوائي','إنشاء'];"
+                    + "for(var p=0;p<pri.length;p++){"
+                    + "for(var i=0;i<els.length;i++){"
+                    + "var tx=(els[i].innerText||els[i].value||'').trim();"
+                    + "if(tx&&tx.indexOf(pri[p])>=0){els[i].click();return tx;}"
+                    + "}}"
+                    + "return '';"
+                    + "})()";
+
+    // نص الصفحة (للتشخيص إذا صار خطأ)
+    private static final String DEBUG_JS =
+            "(function(){var t=document.body?document.body.innerText:'';return t.substring(0,300);})()";
+
+    // يستخرج الأكواد من الصندوق الوارد
+    private static final String EXTRACT_JS =
+            "(function(){"
+                    + "function codes(t){var out=[];var m;"
+                    + "var a=/(code|otp|verify|verification|confirm|رمز|كود|تحقق|تأكيد|التفعيل)[^0-9]{0,40}([0-9]{4,8})/ig;"
+                    + "while((m=a.exec(t))){out.push(m[2]);}"
+                    + "var b=/(^|[^0-9])([0-9]{6})([^0-9]|$)/g;"
+                    + "while((m=b.exec(t))){out.push(m[2]);}"
+                    + "return out;}"
+                    + "var all=codes(document.body?document.body.innerText:'');"
+                    + "var links=[];var seen={};"
+                    + "var as=document.querySelectorAll('a[href]');"
+                    + "for(var i=0;i<as.length;i++){var h=as[i].href;"
+                    + "if(h.indexOf(location.origin)!==0||seen[h]||h===location.href) continue;"
+                    + "if(h.indexOf('blog')>=0) continue;"
+                    + "if(!/(message|inbox|mail|read|view|msg)/i.test(h)) continue;"
+                    + "seen[h]=1;links.push(h);}"
+                    + "var fetched=0;"
+                    + "for(var j=0;j<links.length&&j<8;j++){try{var x=new XMLHttpRequest();x.open('GET',links[j],false);x.send();"
+                    + "if(x.status===200){fetched++;var tx=x.responseText.replace(/<[^>]*>/g,' ');all=all.concat(codes(tx));}}catch(e){}}"
+                    + "var uniq=[];for(var k=0;k<all.length;k++){if(uniq.indexOf(all[k])<0)uniq.push(all[k]);}"
+                    + "var lp=[];for(var q=0;q<links.length&&q<3;q++){lp.push(links[q].replace(location.origin,''));}"
+                    + "return JSON.stringify({codes:uniq,links:links.length,fetched:fetched,sample:lp});"
+                    + "})()";
+
     private WebView webView;
+    private TextView status;
+    private SharedPreferences prefs;
+    private final Handler handler = new Handler(Looper.getMainLooper());
+
+    // كل عنصر: [العنوان, الكوكيز]
+    private final ArrayList<String[]> accounts = new ArrayList<String[]>();
+
+    private boolean busy = false;
+    private boolean pageLoaded = false;
+
+    private int target = 0;
+    private int createdThisRun = 0;
+
+    private int extractIndex = 0;
+    private StringBuilder results = new StringBuilder();
+    private final ArrayList<String> allCodes = new ArrayList<String>();
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
+        prefs = getSharedPreferences("mohmal", MODE_PRIVATE);
+        loadAccounts();
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+
+        LinearLayout bar = new LinearLayout(this);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        Button btnCreate = makeButton("إنشاء إيميلات");
+        Button btnCodes = makeButton("استخراج الأكواد");
+        Button btnList = makeButton("القائمة");
+        bar.addView(btnCreate);
+        bar.addView(btnCodes);
+        bar.addView(btnList);
+
+        status = new TextView(this);
+        status.setPadding(24, 12, 24, 12);
+        status.setVisibility(View.GONE);
+
         webView = new WebView(this);
-        setContentView(webView);
+
+        root.addView(bar, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        root.addView(status, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        root.addView(webView, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        setContentView(root);
+
+        btnCreate.setOnClickListener(v -> askCount());
+        btnCodes.setOnClickListener(v -> startExtract());
+        btnList.setOnClickListener(v -> showList());
 
         WebSettings ws = webView.getSettings();
         ws.setJavaScriptEnabled(true);
@@ -100,6 +222,7 @@ public class MainActivity extends Activity {
 
             @Override
             public void onPageFinished(WebView view, String url) {
+                pageLoaded = true;
                 view.evaluateJavascript(HIDE_ADS_JS, null);
             }
         });
@@ -110,6 +233,309 @@ public class MainActivity extends Activity {
             webView.loadUrl(HOME);
         }
     }
+
+    // ---------- واجهة ----------
+
+    private Button makeButton(String text) {
+        Button b = new Button(this);
+        b.setText(text);
+        b.setAllCaps(false);
+        b.setTextSize(13);
+        b.setLayoutParams(new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        return b;
+    }
+
+    private void toast(String msg) {
+        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show();
+    }
+
+    private void setStatus(String text) {
+        status.setText(text);
+        status.setVisibility(View.VISIBLE);
+    }
+
+    private void endBusy(String msg) {
+        busy = false;
+        status.setVisibility(View.GONE);
+        if (msg != null) toast(msg);
+    }
+
+    private void copy(String text) {
+        ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+        cm.setPrimaryClip(ClipData.newPlainText("mohmal", text));
+        toast("تم النسخ");
+    }
+
+    private static String joinLines(ArrayList<String> list) {
+        StringBuilder sb = new StringBuilder();
+        for (String s : list) {
+            if (sb.length() > 0) sb.append('\n');
+            sb.append(s);
+        }
+        return sb.toString();
+    }
+
+    // ---------- حفظ القائمة ----------
+
+    private void saveAccounts() {
+        JSONArray arr = new JSONArray();
+        try {
+            for (String[] a : accounts) {
+                JSONObject o = new JSONObject();
+                o.put("a", a[0]);
+                o.put("c", a[1]);
+                arr.put(o);
+            }
+        } catch (JSONException ignored) { }
+        prefs.edit().putString("accounts", arr.toString()).apply();
+    }
+
+    private void loadAccounts() {
+        try {
+            JSONArray arr = new JSONArray(prefs.getString("accounts", "[]"));
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.getJSONObject(i);
+                accounts.add(new String[]{o.getString("a"), o.getString("c")});
+            }
+        } catch (JSONException ignored) { }
+    }
+
+    private boolean hasAddress(String addr) {
+        for (String[] a : accounts) {
+            if (a[0].equalsIgnoreCase(addr)) return true;
+        }
+        return false;
+    }
+
+    private static String unquote(String raw) {
+        if (raw == null || raw.equals("null")) return "";
+        try {
+            Object o = new JSONTokener(raw).nextValue();
+            return (o instanceof String) ? (String) o : "";
+        } catch (JSONException e) {
+            return "";
+        }
+    }
+
+    // يمسح الجلسة الحالية (كوكيز + تخزين) ثم ينفذ الخطوة التالية
+    private void clearSession(final Runnable next) {
+        final CookieManager cm = CookieManager.getInstance();
+        WebStorage.getInstance().deleteAllData();
+        cm.removeAllCookies(v -> {
+            cm.flush();
+            next.run();
+        });
+    }
+
+    // ---------- القائمة ----------
+
+    private void showList() {
+        if (accounts.isEmpty()) {
+            toast("القائمة فاضية");
+            return;
+        }
+        final String[] items = new String[accounts.size()];
+        final ArrayList<String> all = new ArrayList<String>();
+        for (int i = 0; i < items.length; i++) {
+            items[i] = accounts.get(i)[0];
+            all.add(items[i]);
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("الإيميلات (اضغط للنسخ)")
+                .setItems(items, (d, which) -> copy(items[which]))
+                .setNeutralButton("نسخ الكل", (d, w) -> copy(joinLines(all)))
+                .setNegativeButton("مسح القائمة", (d, w) -> {
+                    accounts.clear();
+                    saveAccounts();
+                    toast("انمسحت القائمة");
+                })
+                .setPositiveButton("إغلاق", null)
+                .show();
+    }
+
+    // ---------- إنشاء إيميلات ----------
+
+    private void askCount() {
+        if (busy) {
+            toast("في عملية شغالة، انتظر");
+            return;
+        }
+        final EditText input = new EditText(this);
+        input.setInputType(InputType.TYPE_CLASS_NUMBER);
+        input.setHint("العدد (1-" + MAX_BATCH + ")");
+        new AlertDialog.Builder(this)
+                .setTitle("كم إيميل تريد؟")
+                .setView(input)
+                .setPositiveButton("ابدأ", (d, w) -> {
+                    int n = 0;
+                    try {
+                        n = Integer.parseInt(input.getText().toString().trim());
+                    } catch (NumberFormatException e) {
+                        n = 0;
+                    }
+                    if (n < 1) {
+                        toast("اكتب رقم صحيح");
+                        return;
+                    }
+                    if (n > MAX_BATCH) n = MAX_BATCH;
+                    startCreate(n);
+                })
+                .setNegativeButton("إلغاء", null)
+                .show();
+    }
+
+    private void startCreate(int n) {
+        if (busy) return;
+        busy = true;
+        target = n;
+        createdThisRun = 0;
+        createNext();
+    }
+
+    private void createNext() {
+        if (createdThisRun >= target) {
+            endBusy("تم إنشاء " + createdThisRun + " إيميل");
+            showList();
+            return;
+        }
+        setStatus("جاري إنشاء " + (createdThisRun + 1) + " من " + target + "...");
+        clearSession(() -> {
+            pageLoaded = false;
+            webView.loadUrl(HOME);
+            handler.postDelayed(() -> pollAddress(0, false), 3000);
+        });
+    }
+
+    private void pollAddress(final int tries, final boolean clicked) {
+        if (!pageLoaded && tries < 20) {
+            handler.postDelayed(() -> pollAddress(tries + 1, clicked), 1000);
+            return;
+        }
+        webView.evaluateJavascript(FIND_ADDRESS_JS, raw -> {
+            String addr = unquote(raw);
+            if (addr.length() > 0 && !hasAddress(addr)) {
+                String cookies = CookieManager.getInstance().getCookie(SITE);
+                accounts.add(new String[]{addr, cookies == null ? "" : cookies});
+                saveAccounts();
+                createdThisRun++;
+                handler.postDelayed(() -> createNext(), 2000);
+                return;
+            }
+            if (tries >= 25) {
+                failCreate("ما كدرت أحصل على إيميل جديد.");
+                return;
+            }
+            boolean c = clicked;
+            if (tries == 6 && !clicked) {
+                webView.evaluateJavascript(CLICK_CREATE_JS, null);
+                c = true;
+            }
+            final boolean cc = c;
+            handler.postDelayed(() -> pollAddress(tries + 1, cc), 1000);
+        });
+    }
+
+    private void failCreate(final String reason) {
+        webView.evaluateJavascript(DEBUG_JS, raw -> {
+            String sample = unquote(raw);
+            endBusy(null);
+            new AlertDialog.Builder(this)
+                    .setTitle("توقف الإنشاء")
+                    .setMessage(reason + "\nتم إنشاء: " + createdThisRun
+                            + "\n\nنص الصفحة:\n" + sample)
+                    .setPositiveButton("تمام", null)
+                    .show();
+        });
+    }
+
+    // ---------- استخراج الأكواد ----------
+
+    private void startExtract() {
+        if (busy) {
+            toast("في عملية شغالة، انتظر");
+            return;
+        }
+        if (accounts.isEmpty()) {
+            toast("سوي إيميلات أول");
+            return;
+        }
+        busy = true;
+        results = new StringBuilder();
+        allCodes.clear();
+        extractIndex = 0;
+        extractNext();
+    }
+
+    private void extractNext() {
+        if (extractIndex >= accounts.size()) {
+            endBusy(null);
+            showCodes();
+            return;
+        }
+        final String[] acc = accounts.get(extractIndex);
+        setStatus("فحص " + (extractIndex + 1) + " من " + accounts.size() + "...");
+        clearSession(() -> {
+            CookieManager cm = CookieManager.getInstance();
+            for (String part : acc[1].split(";")) {
+                String p = part.trim();
+                if (p.length() > 0) cm.setCookie(SITE, p + "; Path=/");
+            }
+            cm.flush();
+            pageLoaded = false;
+            webView.loadUrl(HOME);
+            handler.postDelayed(() -> pollExtract(0), 3000);
+        });
+    }
+
+    private void pollExtract(final int tries) {
+        if (!pageLoaded && tries < 20) {
+            handler.postDelayed(() -> pollExtract(tries + 1), 1000);
+            return;
+        }
+        handler.postDelayed(() -> webView.evaluateJavascript(EXTRACT_JS,
+                raw -> onExtracted(unquote(raw))), 2500);
+    }
+
+    private void onExtracted(String json) {
+        results.append(accounts.get(extractIndex)[0]).append('\n');
+        try {
+            JSONObject o = new JSONObject(json);
+            JSONArray a = o.getJSONArray("codes");
+            if (a.length() == 0) {
+                results.append("   لا توجد أكواد (روابط: ").append(o.getInt("links")).append(")\n");
+                JSONArray s = o.getJSONArray("sample");
+                for (int i = 0; i < s.length(); i++) {
+                    results.append("   ").append(s.getString(i)).append('\n');
+                }
+            } else {
+                StringBuilder c = new StringBuilder();
+                for (int i = 0; i < a.length(); i++) {
+                    if (c.length() > 0) c.append(", ");
+                    c.append(a.getString(i));
+                    allCodes.add(a.getString(i));
+                }
+                results.append("   ").append(c).append('\n');
+            }
+        } catch (JSONException e) {
+            results.append("   تعذر قراءة النتيجة\n");
+        }
+        results.append('\n');
+        extractIndex++;
+        extractNext();
+    }
+
+    private void showCodes() {
+        new AlertDialog.Builder(this)
+                .setTitle("الأكواد")
+                .setMessage(results.toString())
+                .setPositiveButton("تحديث", (d, w) -> startExtract())
+                .setNeutralButton("نسخ الأكواد", (d, w) -> copy(joinLines(allCodes)))
+                .setNegativeButton("إغلاق", null)
+                .show();
+    }
+
+    // ---------- عام ----------
 
     private static boolean matches(String host, String[] list) {
         host = host.toLowerCase();
@@ -136,6 +562,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        handler.removeCallbacksAndMessages(null);
         if (webView != null) webView.destroy();
         super.onDestroy();
     }
