@@ -13,6 +13,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.InputType;
+import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
 import android.webkit.CookieManager;
@@ -33,7 +34,11 @@ import org.json.JSONException;
 import org.json.JSONObject;
 import org.json.JSONTokener;
 
+import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.util.ArrayList;
 
 public class MainActivity extends Activity {
@@ -41,6 +46,12 @@ public class MainActivity extends Activity {
     private static final String HOME = "https://www.mohmal.com/ar";
     private static final String SITE = "https://www.mohmal.com";
     private static final int MAX_BATCH = 20;
+
+    // مفتاح الإيقاف عن بعد: إذا انحذف هذا الملف من GitHub أو انكتب بيه off يتوقف التطبيق
+    private static final String STATUS_URL =
+            "https://raw.githubusercontent.com/7areq1-wq/mohmal/main/status.txt";
+    private static final long GRACE_MS = 3L * 24 * 60 * 60 * 1000; // 3 أيام بدون إنترنت
+    private static final String DEFAULT_OFF_MSG = "التطبيق متوقف حالياً.";
 
     private static final String[] OWN_HOSTS = {
             "mohmal.com", "mohmal.in", "mohmal.im",
@@ -126,6 +137,9 @@ public class MainActivity extends Activity {
 
     private WebView webView;
     private TextView status;
+    private TextView blockView;
+    private LinearLayout bar;
+    private boolean blocked = false;
     private SharedPreferences prefs;
     private final Handler handler = new Handler(Looper.getMainLooper());
 
@@ -152,7 +166,7 @@ public class MainActivity extends Activity {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
 
-        LinearLayout bar = new LinearLayout(this);
+        bar = new LinearLayout(this);
         bar.setOrientation(LinearLayout.HORIZONTAL);
         Button btnCreate = makeButton("إنشاء إيميلات");
         Button btnCodes = makeButton("استخراج الأكواد");
@@ -172,6 +186,14 @@ public class MainActivity extends Activity {
         root.addView(status, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
         root.addView(webView, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        blockView = new TextView(this);
+        blockView.setGravity(Gravity.CENTER);
+        blockView.setPadding(48, 48, 48, 48);
+        blockView.setTextSize(18);
+        blockView.setVisibility(View.GONE);
+        root.addView(blockView, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
         setContentView(root);
 
@@ -230,6 +252,100 @@ public class MainActivity extends Activity {
         if (savedInstanceState != null) {
             webView.restoreState(savedInstanceState);
         } else {
+            webView.loadUrl(HOME);
+        }
+    }
+
+    // ---------- مفتاح الإيقاف عن بعد ----------
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        checkStatus();
+    }
+
+    private void checkStatus() {
+        final long startTime = System.currentTimeMillis();
+        if (!prefs.contains("lastOk")) {
+            prefs.edit().putLong("lastOk", startTime).apply();
+        }
+        new Thread(() -> {
+            // 0 = ما قدرنا نتأكد، 1 = شغال، 2 = متوقف
+            int state = 0;
+            String msg = DEFAULT_OFF_MSG;
+            try {
+                URL url = new URL(STATUS_URL + "?t=" + System.currentTimeMillis());
+                HttpURLConnection c = (HttpURLConnection) url.openConnection();
+                c.setConnectTimeout(8000);
+                c.setReadTimeout(8000);
+                c.setUseCaches(false);
+                int code = c.getResponseCode();
+                if (code == 200) {
+                    BufferedReader r = new BufferedReader(
+                            new InputStreamReader(c.getInputStream(), "UTF-8"));
+                    String first = r.readLine();
+                    StringBuilder rest = new StringBuilder();
+                    String line;
+                    while ((line = r.readLine()) != null) {
+                        if (rest.length() > 0) rest.append('\n');
+                        rest.append(line);
+                    }
+                    r.close();
+                    String f = first == null ? "" : first.trim();
+                    if (f.equalsIgnoreCase("on")) {
+                        state = 1;
+                    } else if (f.equalsIgnoreCase("off")) {
+                        state = 2;
+                        if (rest.toString().trim().length() > 0) msg = rest.toString().trim();
+                    }
+                } else if (code == 404 || code == 403 || code == 410) {
+                    state = 2;
+                    msg = "هذا التطبيق لم يعد متاحاً.";
+                }
+                c.disconnect();
+            } catch (Exception e) {
+                state = 0;
+            }
+
+            final boolean fBlock;
+            final String fMsg;
+            if (state == 1) {
+                prefs.edit().putLong("lastOk", System.currentTimeMillis()).apply();
+                fBlock = false;
+                fMsg = "";
+            } else if (state == 2) {
+                fBlock = true;
+                fMsg = msg;
+            } else {
+                long last = prefs.getLong("lastOk", startTime);
+                if (System.currentTimeMillis() - last > GRACE_MS) {
+                    fBlock = true;
+                    fMsg = "تعذر التحقق من حالة التطبيق. اتصل بالإنترنت ثم أعد فتحه.";
+                } else {
+                    fBlock = false;
+                    fMsg = "";
+                }
+            }
+            handler.post(() -> applyStatus(fBlock, fMsg));
+        }).start();
+    }
+
+    private void applyStatus(boolean block, String msg) {
+        if (block) {
+            blocked = true;
+            busy = false;
+            handler.removeCallbacksAndMessages(null);
+            status.setVisibility(View.GONE);
+            bar.setVisibility(View.GONE);
+            webView.setVisibility(View.GONE);
+            webView.loadUrl("about:blank");
+            blockView.setText(msg);
+            blockView.setVisibility(View.VISIBLE);
+        } else if (blocked) {
+            blocked = false;
+            blockView.setVisibility(View.GONE);
+            bar.setVisibility(View.VISIBLE);
+            webView.setVisibility(View.VISIBLE);
             webView.loadUrl(HOME);
         }
     }
