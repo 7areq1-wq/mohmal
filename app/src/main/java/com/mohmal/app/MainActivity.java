@@ -85,11 +85,14 @@ public class MainActivity extends Activity {
     // يدور على عنوان الإيميل بالصفحة
     private static final String FIND_ADDRESS_JS =
             "(function(){"
-                    + "var re=/[A-Za-z0-9._%+-]+@(mailna[.]co|mozej[.]com|mailna[.]in|mailna[.]me|mohmal[.]im|mohmal[.]in)/i;"
-                    + "var t=document.body?document.body.innerText:'';"
-                    + "var m=t.match(re); if(m) return m[0];"
+                    + "function pick(t){var re=/[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+([.][A-Za-z0-9-]+)+/g;var m;"
+                    + "while((m=re.exec(t))){var a=m[0];var l=a.toLowerCase();"
+                    + "if(l.indexOf('@mohmal.com')<0&&l.indexOf('@www.mohmal.com')<0) return a;}"
+                    + "return '';}"
+                    + "var r=pick(document.body?document.body.innerText:'');"
+                    + "if(r) return r;"
                     + "var inp=document.querySelectorAll('input,textarea');"
-                    + "for(var i=0;i<inp.length;i++){var mm=(inp[i].value||'').match(re); if(mm) return mm[0];}"
+                    + "for(var i=0;i<inp.length;i++){var rr=pick(inp[i].value||''); if(rr) return rr;}"
                     + "return '';"
                     + "})()";
 
